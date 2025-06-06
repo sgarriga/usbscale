@@ -11,6 +11,7 @@
 /*
 usbscale
 Copyright (C) 2011--2023 Eric Jiang
+Conversion options added June 2025 Stephen Garriga
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -54,7 +55,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // Define the number of bytes long that each type of report is
 #define WEIGH_REPORT_SIZE 6
-#define CONTROL_REPORT_SIZE 2
+#define TARE_REPORT_SIZE 2
 
 // `le16toh` is not available on MacOS (as of 12.6) but we can replace it with
 // a similar function.
@@ -73,7 +74,7 @@ static libusb_device* find_nth_scale(libusb_device**, int);
 // it, printing out the result to the screen. It also returns a 1 if the
 // program should read again (i.e. continue looping).
 //
-static int print_scale_data(unsigned char*);
+static int print_scale_data(unsigned char*, uint8_t);
 
 //
 // take device and fetch bEndpointAddress for the first endpoint
@@ -96,7 +97,7 @@ const char* UNITS[13] = {
     "g",            // gram
     "kg",           // kilogram
     "cd",           // carat
-    "taels",        // lian
+    "taels",        // tael
     "gr",           // grain
     "dwt",          // pennyweight
     "tonnes",       // metric tons
@@ -106,14 +107,63 @@ const char* UNITS[13] = {
     "lbs"           // pound
 };
 
+// 
+// this enum gives us useful names values to index into UNITS
+//
+enum units { 
+    unknown,
+    milligrams,
+    grammes,
+    kilograms,
+    carats,
+    taels,
+    grains,
+    pennyweights,
+    tonnes,
+    tons,
+    troy_oz,
+    ounces,
+    pounds };
+
+// 
+// conversion factors retative to kilogram
+//
+const double vs_kg[13] = {
+    0.0,                 // unknown unit - code to ensure we never divide by this!
+    10000000.0,          // kg to mg
+    1000.0,              // kg to g
+    1.0,                 // kg to kg
+    5000.0,              // kg to carat
+    26.659557451346306,  // kg to tael
+    15432.358352941,     // kg to grain
+    643.01493137256,     // kg to dwt
+    0.001,               // kg to metric tonne
+    0.0011023113109244,  // kg to avoir/short/US ton
+    32.150746568628,     // kg to troy ounce
+    35.27396194958,      // kg to oz t
+    2.2046226218488      // kg to lb     
+};
 // Setup argument parsing
-const char *argp_program_version = "usbscale 0.2";
-const char *argp_program_bug_address = "<https://www.github.com/erjiang/usbscale/issues>";
+const char *argp_program_version = "usbscale 0.2.sg"; // tweaked from Eric's version
+const char *argp_program_bug_address = "<https://www.github.com/sgarriga/usbscale/issues>";
 static char doc[] = "Read weight from a USB scale\n"
 "The `zero' command will request the scale to reset to zero (not supported by all scales).\n";
 static char args_doc[] = "[zero]";
 static struct argp_option options[] = {
     { "index", 'i', "INDEX", 0, "Index of scale to read (default: 1)" },
+    { "units", 'U', "UNITS", 0, "Units in which to report (default to scale)\n"
+    " mg     - milligrams\t"
+    "g      - grams\n"
+    " kg     - kilograms\t"
+    "cd     - carats\n"
+    " taels  - taels\t\t"
+    "gr     - grains\n"
+    " dwt    - pennyweights\t"
+    "tonnes - metric tonnes\n"
+    " tons   - US tons\t"
+    "ozt    - troy ounces\n"
+    " oz     - ounces\t\t"
+    "lbs    - pounds" },
     { 0 }
 };
 
@@ -121,6 +171,7 @@ static struct argp_option options[] = {
 struct arguments {
     int index;
     bool tare;
+    uint8_t want_unit;
 };
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
@@ -131,6 +182,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             // Make sure index is >0 since the first scale has index 1.
             if (arguments->index < 1) {
                 argp_usage(state);
+            }
+            break;
+        case 'U':
+            for (arguments->want_unit = pounds; arguments->want_unit > unknown; arguments->want_unit--) {
+                if (!strcmp(arg, UNITS[arguments->want_unit])) {
+                    break;
+                }
             }
             break;
         case ARGP_KEY_ARG:
@@ -162,6 +220,7 @@ int main(int argc, char **argv)
     // By default, get the first scale's weight
     arguments.index = 1;
     arguments.tare = false;
+    arguments.want_unit = (uint8_t) unknown;
     argp_parse(&argp, argc, argv, 0, 0, &arguments);
 
     libusb_device **devs;
@@ -247,7 +306,7 @@ int main(int argc, char **argv)
     len = 0;
     int scale_result = -1;
 
-    // lowest bit is Enforced Zero Return, second bit is Zero Scale
+    // Control report - data byte lowest bit is Enforced Zero Return, second bit is Zero Scale
     unsigned char tare_report[] = {0x02, 0x02};
 
     if (arguments.tare) {
@@ -255,7 +314,7 @@ int main(int argc, char **argv)
             handle,
             LIBUSB_ENDPOINT_OUT + 2, // direction=host to device, type=standard, recipient=device
             tare_report,
-            CONTROL_REPORT_SIZE,
+            TARE_REPORT_SIZE,
             &len,
             10000
             );
@@ -314,7 +373,7 @@ int main(int argc, char **argv)
             }
 #endif
             if (weigh_count < 1) {
-                scale_result = print_scale_data(data);
+                scale_result = print_scale_data(data, arguments.want_unit);
                 if(scale_result != 1)
                    break;
             }
@@ -358,7 +417,7 @@ int main(int argc, char **argv)
 // the scale data indicates that some error occurred and that the program
 // should terminate.
 //
-static int print_scale_data(unsigned char* dat) {
+static int print_scale_data(unsigned char* dat, uint8_t want_unit) {
 
     //
     // We keep around `lastStatus` so that we're not constantly printing the
@@ -412,7 +471,13 @@ static int print_scale_data(unsigned char* dat) {
         // the `UNITS` lookup table for unit names.
         //
         case 0x04:
-            printf("%g %s\n", weight, UNITS[unit]);
+            // convert to desired units
+            if (want_unit) {
+                double wweight = (weight / vs_kg[unit]) * vs_kg[want_unit]; 
+                printf("%g %s\n", wweight, UNITS[want_unit]);
+            }
+            else // to avoid a division-by-zero when using default units
+                printf("%g %s\n", weight, UNITS[unit]);
             return 0;
         case 0x05:
             if(status != lastStatus)
